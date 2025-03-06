@@ -1,0 +1,13 @@
+version: "1"
+rules:
+  - base: adam
+    upstream: dmunozv04:main
+    assignees:
+      - alussier
+    reviewers:
+      - alussier
+    conflictReviewers:
+      - alussier
+  - base: main
+    upstream: dmunozv04:main
+    mergeMethod: hardreset
