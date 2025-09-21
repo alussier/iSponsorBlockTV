@@ -7,6 +7,7 @@ from typing import Optional
 import aiohttp
 
 from . import api_helpers, ytlounge
+from .debug_helpers import AiohttpTracer
 
 
 class DeviceListener:
@@ -18,16 +19,6 @@ class DeviceListener:
         self.cancelled = False
         self.logger = logging.getLogger(f"iSponsorBlockTV-{device.screen_id}")
         self.web_session = web_session
-        if debug:
-            self.logger.setLevel(logging.DEBUG)
-        else:
-            self.logger.setLevel(logging.INFO)
-        sh = logging.StreamHandler()
-        sh.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-        self.logger.addHandler(sh)
-        self.logger.info("Starting device")
         self.lounge_controller = ytlounge.YtLoungeApi(
             device.screen_id, config, api_helper, self.logger
         )
@@ -39,14 +30,12 @@ class DeviceListener:
             try:
                 await self.lounge_controller.refresh_auth()
             except BaseException:
-                # traceback.print_exc()
                 pass
 
     async def is_available(self):
         try:
             return await self.lounge_controller.is_available()
         except BaseException:
-            # traceback.print_exc()
             return False
 
     # Main subscription loop
@@ -60,6 +49,7 @@ class DeviceListener:
                 except BaseException:
                     await asyncio.sleep(10)
             while not (await self.is_available()) and not self.cancelled:
+                self.logger.debug("Waiting for device to be available")
                 await asyncio.sleep(10)
             try:
                 await lounge_controller.connect()
@@ -67,6 +57,7 @@ class DeviceListener:
                 pass
             while not lounge_controller.connected() and not self.cancelled:
                 # Doesn't connect to the device if it's a kids profile (it's broken)
+                self.logger.debug("Waiting for device to be connected")
                 await asyncio.sleep(10)
                 try:
                     await lounge_controller.connect()
@@ -76,7 +67,7 @@ class DeviceListener:
                 "Connected to device %s (%s)", lounge_controller.screen_name, self.name
             )
             try:
-                self.logger.info("Subscribing to lounge")
+                self.logger.debug("Subscribing to lounge")
                 sub = await lounge_controller.subscribe_monitored(self)
                 await sub
             except BaseException:
@@ -84,11 +75,11 @@ class DeviceListener:
 
     # Method called on playback state change
     async def __call__(self, state):
+        time_start = time.monotonic()
         try:
             self.task.cancel()
         except BaseException:
             pass
-        time_start = time.time()
         self.task = asyncio.create_task(self.process_playstatus(state, time_start))
 
     # Processes the playback state change
@@ -97,9 +88,7 @@ class DeviceListener:
         if state.videoId:
             segments = await self.api_helper.get_segments(state.videoId)
         if state.state.value == 1:  # Playing
-            self.logger.info(
-                f"Playing video {state.videoId} with {len(segments)} segments"
-            )
+            self.logger.info("Playing video %s with %d segments", state.videoId, len(segments))
             if segments:  # If there are segments
                 await self.time_to_segment(segments, state.currentTime, time_start)
 
@@ -108,28 +97,32 @@ class DeviceListener:
         start_next_segment = None
         next_segment = None
         for segment in segments:
-            if position < 2 and (segment["start"] <= position < segment["end"]):
+            segment_start = segment["start"]
+            segment_end = segment["end"]
+            is_within_start_range = (
+                position < 1 < segment_end and segment_start <= position < segment_end
+            )
+            is_beyond_current_position = segment_start > position
+
+            if is_within_start_range or is_beyond_current_position:
                 next_segment = segment
-                start_next_segment = (
-                    position  # different variable so segment doesn't change
-                )
-                break
-            if segment["start"] > position:
-                next_segment = segment
-                start_next_segment = next_segment["start"]
+                start_next_segment = position if is_within_start_range else segment_start
                 break
         if start_next_segment:
             time_to_next = (
-                start_next_segment - position - (time.time() - time_start) - self.offset
-            )
+                (start_next_segment - position - (time.monotonic() - time_start))
+                / self.lounge_controller.playback_speed
+            ) - self.offset
             await self.skip(time_to_next, next_segment["end"], next_segment["UUID"])
 
     # Skips to the next segment (waits for the time to pass)
     async def skip(self, time_to, position, uuids):
         await asyncio.sleep(time_to)
         self.logger.info("Skipping segment: seeking to %s", position)
-        await asyncio.create_task(self.api_helper.mark_viewed_segments(uuids))
-        await asyncio.create_task(self.lounge_controller.seek_to(position))
+        await asyncio.gather(
+            asyncio.create_task(self.lounge_controller.seek_to(position)),
+            asyncio.create_task(self.api_helper.mark_viewed_segments(uuids)),
+        )
 
     async def cancel(self):
         self.cancelled = True
@@ -152,9 +145,7 @@ class DeviceListener:
 
 
 async def finish(devices, web_session, tcp_connector):
-    await asyncio.gather(
-        *(device.cancel() for device in devices), return_exceptions=True
-    )
+    await asyncio.gather(*(device.cancel() for device in devices), return_exceptions=True)
     await web_session.close()
     await tcp_connector.close()
 
@@ -163,14 +154,30 @@ def handle_signal(signum, frame):
     raise KeyboardInterrupt()
 
 
-async def main_async(config, debug):
+async def main_async(config, debug, http_tracing):
     loop = asyncio.get_event_loop_policy().get_event_loop()
     tasks = []  # Save the tasks so the interpreter doesn't garbage collect them
     devices = []  # Save the devices to close them later
     if debug:
         loop.set_debug(True)
+
     tcp_connector = aiohttp.TCPConnector(ttl_dns_cache=300)
-    web_session = aiohttp.ClientSession(connector=tcp_connector)
+
+    # Configure session with tracing if enabled
+    if http_tracing:
+        root_logger = logging.getLogger("aiohttp_trace")
+        tracer = AiohttpTracer(root_logger)
+        trace_config = aiohttp.TraceConfig()
+        trace_config.on_request_start.append(tracer.on_request_start)
+        trace_config.on_response_chunk_received.append(tracer.on_response_chunk_received)
+        trace_config.on_request_end.append(tracer.on_request_end)
+        trace_config.on_request_exception.append(tracer.on_request_exception)
+        web_session = aiohttp.ClientSession(
+            trust_env=config.use_proxy, connector=tcp_connector, trace_configs=[trace_config]
+        )
+    else:
+        web_session = aiohttp.ClientSession(trust_env=config.use_proxy, connector=tcp_connector)
+
     api_helper = api_helpers.ApiHelper(config, web_session)
     for i in config.devices:
         device = DeviceListener(api_helper, config, i, debug, web_session)
@@ -191,11 +198,8 @@ async def main_async(config, debug):
     finally:
         await web_session.close()
         await tcp_connector.close()
-        loop.close()
         print("Exited")
 
 
-def main(config, debug):
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main_async(config, debug))
-    loop.close()
+def main(config, debug, http_tracing):
+    asyncio.run(main_async(config, debug, http_tracing))

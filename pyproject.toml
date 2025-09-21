@@ -1,6 +1,6 @@
 [project]
 name = "iSponsorBlockTV"
-version = "2.3.1"
+version = "2.6.0"
 authors = [
     {"name" = "dmunozv04"}
 ]
@@ -29,5 +29,5 @@ files = ["requirements.txt"]
 requires = ["hatchling", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
 
-[tool.black]
-line-length = 88
+[tool.ruff]
+line-length = 100
